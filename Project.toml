@@ -1,0 +1,4 @@
+name = "QuadShellFiniteElement"
+uuid = "2cf2d5d9-e904-4f26-b7e7-5697fc87be9e"
+version = "0.1.0"
+authors = ["Cris Moen <cris.moen@runtosolve.com>"]
