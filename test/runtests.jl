@@ -32,7 +32,7 @@ t = 0.0346 * 25.4     # mm (33 mil), b/t ≈ 105
 
         T = Q.calculation_rotation_matrix(Pg)
         xl = Q.global_nodal_coords_to_planar_coords(Pg, T)
-        ke_local = Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, tt, xl; Cs = 0.0)
+        ke_local = Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, tt, xl; Cs = 0.0, drilling = :penalty)
         Te = Q.rotation_matrix_for_element_stiffness_drilling(T)
         ke_global = Te * ke_local * Te'
 
@@ -53,6 +53,22 @@ t = 0.0346 * 25.4     # mm (33 mil), b/t ≈ 105
         ev = eigvals(Symmetric(ke_local[nd, nd]))
         @test count(abs.(ev) .< 1e-9 * maximum(ev)) == 6
 
+        # Hughes–Brezzi drilling (default): same membrane and plate blocks, and the full 24×24 matrix
+        # has exactly six zero-energy modes (the drilling dofs follow a rigid in-plane rotation)
+        ke_hb = Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, tt, xl; Cs = 0.0)
+        @test Q.DEFAULT_DRILLING == :hughes_brezzi
+        @test ke_hb ≈ ke_hb'
+        w24 = [3, 4, 5, 9, 10, 11, 15, 16, 17, 21, 22, 23]
+        @test ke_hb[w24, w24] ≈ ke_local[w24, w24] rtol = 1e-12
+        ev_hb = eigvals(Symmetric(ke_hb))
+        @test count(abs.(ev_hb) .< 1e-9 * maximum(ev_hb)) == 6
+        d = zeros(24)                                        # rigid in-plane rotation ω about the origin
+        for i in 1:4
+            d[6(i-1)+1] = -xl[i][2]; d[6(i-1)+2] = xl[i][1]; d[6(i-1)+6] = 1.0
+        end
+        @test norm(ke_hb * d) < 1e-9 * maximum(abs, ke_hb)
+        @test_throws ArgumentError Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, tt, xl; drilling = :none)
+
         # membrane and plate blocks are the uncondensed MATLAB routines' condensed results
         Tm, P1e, P2e, P3e, P4e = AdanyReference.ct_4node_g2e(collect.(Pg)...)
         G = E / (2(1 + ν))
@@ -63,7 +79,7 @@ t = 0.0346 * 25.4     # mm (33 mil), b/t ≈ 105
         @test ke_local[w24, w24] ≈ ke_wt rtol = 1e-12
 
         # shear relaxation reduces (never increases) stiffness and leaves the membrane block untouched
-        ke_relaxed = Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, tt, xl; Cs = 0.2)
+        ke_relaxed = Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, tt, xl; Cs = 0.2, drilling = :penalty)
         @test all(eigvals(Symmetric(ke_local - ke_relaxed)) .> -1e-8 * maximum(abs, ke_local))
         @test ke_relaxed[m24, m24] ≈ ke_local[m24, m24]
         @test Q.DEFAULT_SHEAR_RELAXATION == 0.1
@@ -80,7 +96,7 @@ t = 0.0346 * 25.4     # mm (33 mil), b/t ≈ 105
         xl = Q.global_nodal_coords_to_planar_coords(Pg, T)
         @test T ≈ readmat("T.txt") atol = 1e-12
         @test reduce(hcat, collect.(xl))' ≈ readmat("nodes_local.txt")[:, 1:2] atol = 1e-10
-        ke_local = Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, Eo, νo, to, xl; Cs = 0.0)
+        ke_local = Q.local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, Eo, νo, to, xl; Cs = 0.0, drilling = :penalty)
         Te = Q.rotation_matrix_for_element_stiffness_drilling(T)
         @test ke_local ≈ readmat("ke24_local.txt") rtol = 1e-12
         @test Te * ke_local * Te' ≈ readmat("ke24_global.txt") rtol = 1e-12
@@ -188,5 +204,37 @@ t = 0.0346 * 25.4     # mm (33 mil), b/t ≈ 105
     @testset "clamped square plate, k ≈ 10.07" begin
         @test plate_buckling(b, b, t, 16, 16; clamped = true).k ≈ 10.07 rtol = 0.02
         @test plate_buckling(b, b, t, 24, 24; clamped = true).k ≈ 10.07 rtol = 0.02
+    end
+
+    @testset "torsion of folded strips (drilling dof treatment)" begin
+        # Saint-Venant J from a warping-free static twist (Moen 2008, Sec. 4.2.7.3.2.3): T = G J β′.
+        # Thin-walled J = Σ b t³/3; the exact rectangle value carries the free-edge factor 1 − 0.63 t/b.
+        tt = 1.0
+        flat = torsion_J(strip_section(0.0, 76.2), tt)                      # 3 in strip, 8 elements across
+        @test flat.J / flat.Jthin ≈ 1 - 0.63 * tt / 76.2 rtol = 0.02
+        @test flat.Fnet < 1e-8
+        # the flat strip does not care about the drilling treatment
+        @test torsion_J(strip_section(0.0, 76.2), tt; drilling = :penalty).J ≈ flat.J rtol = 1e-6
+        # folding the strip in two at any angle must not change J (the twisting moment crosses the fold);
+        # each half has its own free-edge correction, so the 90° angle is slightly below the flat strip
+        for α in (5.0, 30.0, 90.0)
+            fold = torsion_J(strip_section(α, 76.2), tt)
+            @test fold.J ≈ flat.J rtol = 0.005
+            @test fold.Fnet < 1e-8                                          # pure torsion, no net end force
+        end
+        # the legacy absolute penalty stiffens the fold and leaves a spurious net end force
+        pen = torsion_J(strip_section(90.0, 76.2), tt; drilling = :penalty)
+        @test pen.Fnet > 1e-4
+        # rounded lipped C (Abaqus-like mesh: 4 elements per flat, 5 per corner): J ≈ 0.987 Σbt³/3 with
+        # Hughes–Brezzi (exact Saint-Venant value is 0.9956 Σbt³/3). With the penalty J is far too large
+        # and, because of the spurious net end force, depends on the point the twist is applied about
+        # (1.29 × here about the section's mean point, 2.1 × about the shear center)
+        c = torsion_J(lipped_c_section(), 1.88)
+        @test c.J / c.Jthin ≈ 0.987 rtol = 0.01
+        @test c.Fnet < 1e-6
+        @test torsion_J(lipped_c_section(), 1.88; drilling = :penalty).J / c.Jthin > 1.2
+        # insensitive to the Hughes–Brezzi factor
+        @test torsion_J(lipped_c_section(), 1.88; drilling_gamma = 0.1).J ≈ c.J rtol = 0.02
+        @test torsion_J(lipped_c_section(), 1.88; drilling_gamma = 10.0).J ≈ c.J rtol = 0.005
     end
 end

@@ -16,7 +16,7 @@ and coded in MATLAB as `ke_uv_4n_condens_from_12to8dof_num.m` and `ke_wt_4n_cond
 - Composite element formulation combining:
   - In-plane membrane stiffness (4 + 2 shape functions, 12 → 8 DOF by static condensation, 2×2 Gauss)
   - Out-of-plane Mindlin–Reissner plate bending and transverse shear stiffness with 5/6 shear correction factor (4 + 2 shape functions, 18 → 12 DOF by static condensation, 3×3 Gauss)
-  - Drilling DOF stabilization (penalty stiffness of 1/100 of the smallest rotational diagonal term)
+  - Drilling DOF: Hughes–Brezzi term γ∫(θᵤ − ½(∂v/∂x − ∂u/∂y))² dA (default), or the MATLAB q42 penalty stiffness of 1/100 of the smallest rotational diagonal term (`drilling = :penalty`)
   - Optional Tessler–Hughes type shear relaxation factor `Cs` to remove residual shear locking in thin plates
 - Geometric stiffness matrix for linear buckling analysis (Moen & Ádány 2025, Eq. 11–13)
 - Membrane stress recovery in the element local frame and a consistent uniform pressure load vector
@@ -44,7 +44,7 @@ The local element stiffness is assembled from:
 |---|---|---|---|
 | Membrane | 12×12 | 8×8 | Plane stress, 6 shape functions × 2 DOF, 2×2 Gauss |
 | Bending + shear | 18×18 | 12×12 | Mindlin plate, 6 shape functions × 3 DOF (w, θₓ, θᵧ), 3×3 Gauss, condensed together |
-| Drilling | — | 4 diagonal terms | Penalty stiffness |
+| Drilling | — | 24×24 rank-4 term (Hughes–Brezzi) or 4 diagonal terms (penalty) | see *Drilling degree of freedom* below |
 
 Element matrices are formed in a local planar frame whose normal is perpendicular to the average plane of the four (possibly warped) nodes, then rotated to global XYZ. In the assembled global matrices the DOFs follow the Ferrite field order (`:u` translations of the four nodes, then `:θ` rotations).
 
@@ -147,6 +147,21 @@ Kg = QuadShellFiniteElement.assemble_global_Kg!(Kg, dh, qr_g, ip4, σXX .* t, σ
 
 ---
 
+## Drilling degree of freedom
+
+The drilling rotation θᵤ (about the element normal) has no stiffness of its own in a Mindlin shell. Two treatments are available through the `drilling` keyword of `local_elastic_stiffness_matrix!` and `assemble_global_Ke!`:
+
+- `drilling = :hughes_brezzi` (default, `DEFAULT_DRILLING`): the Hughes & Brezzi (1989) term γ∫(θᵤ − ½(∂v/∂x − ∂u/∂y))² dA with γ = `drilling_gamma` × G t (`DEFAULT_DRILLING_GAMMA = 1.0`), integrated with the membrane quadrature on the bilinear corner functions. It ties θᵤ to the in-plane rotation of the membrane displacement field, so a rigid in-plane rotation costs no energy and the full 24×24 matrix has exactly six zero-energy modes.
+- `drilling = :penalty`: S. Ádány's MATLAB q42 treatment, a diagonal penalty of 1/100 of the smallest rotational diagonal term on each θᵤ. This is the form reproduced to machine precision by the MATLAB/Octave reference tests.
+
+The choice does not matter for flat plates (all benchmarks below are identical to 4–6 digits), but it decides the torsional behavior of folded and curved meshes. In Saint-Venant torsion every plate strip rotates in-plane at the rate β′h, which the absolute penalty resists, so the torsion constant of a rounded lipped C comes out 2.1 × too large on a 4-per-flat / 5-per-corner mesh and 3.4 × on a finer one, with a spurious net in-plane end reaction. Removing the penalty swings the other way: a strip's twisting moment cannot cross a fold line into its neighbor, every fold behaves like a Mindlin free edge and J drops by ≈ 0.63 t⁴/3 per fold (12 % low for the lipped C). The Hughes–Brezzi term transfers the moment across folds and gives J within 1 % of the exact 2D Saint-Venant value, independent of mesh and insensitive to γ between 0.1 and 10 G t. `test/runtests.jl` ("torsion of folded strips") twists a flat strip, the same strip folded at 5°, 30° and 90°, and a rounded lipped C with a warping-free static twist (Moen 2008, Sec. 4.2.7.3.2.3) and checks these statements.
+
+```julia
+K = QuadShellFiniteElement.assemble_global_Ke!(K, dh, qr_m, qr_b, ip4, ip6, E, ν, t; drilling = :penalty)   # MATLAB q42
+```
+
+---
+
 ## Shear Relaxation Factor `Cs`
 
 With `Cs = 0` the element is exactly the MATLAB `q42` element. Its two condensed bubble modes remove the shear locking of the bilinear Mindlin quadrilateral in beam-like bending, but not in general plate bending: for thin plates meshed with elements much larger than the thickness the parasitic shear stiffness still dominates and buckling loads come out too high. To control this the transverse shear stiffness is scaled by `1 / (1 + Cs * alpha)`, where `alpha` is the ratio of the element shear to bending rotational stiffness (a Tessler–Hughes type relaxation), as in `TriShellFiniteElement.jl`.
@@ -192,7 +207,7 @@ The thick cases include the Mindlin shear deformation (Euler–Bernoulli would g
 using Pkg; Pkg.test("QuadShellFiniteElement")
 ```
 
-`test/runtests.jl` checks the element matrices on a distorted, warped and tilted quadrilateral against two independent references: `test/reference/octave_q42/`, the matrices written by S. Ádány's unmodified MATLAB routines (`ct_4node_g2e.m`, `ke_uv_4n_condens_from_12to8dof_num.m`, `ke_wt_4n_condens_from_18to12dof_num.m`, `add_drill.m`, `rotate3d.m`) run in GNU Octave with `test/reference/make_reference.m`, and `test/adany_matlab_reference.jl`, a line-by-line Julia transcription of the same routines. Agreement is to round-off (relative difference of order 1e-15). The suite also verifies symmetry, six rigid body modes and a constant-strain membrane patch test; runs the SSRC 2025 benchmarks above; and solves simply supported and clamped rectangular plate buckling problems, including thickness independence and invariance to the plate's orientation in 3D. `test/benchmarks.jl` holds the mesh and solver drivers shared by the tests.
+`test/runtests.jl` checks the element matrices on a distorted, warped and tilted quadrilateral against two independent references: `test/reference/octave_q42/`, the matrices written by S. Ádány's unmodified MATLAB routines (`ct_4node_g2e.m`, `ke_uv_4n_condens_from_12to8dof_num.m`, `ke_wt_4n_condens_from_18to12dof_num.m`, `add_drill.m`, `rotate3d.m`) run in GNU Octave with `test/reference/make_reference.m`, and `test/adany_matlab_reference.jl`, a line-by-line Julia transcription of the same routines. Agreement is to round-off (relative difference of order 1e-15). The MATLAB comparisons use `drilling = :penalty`. The suite also verifies symmetry, six rigid body modes (with and without the drilling dofs for the Hughes–Brezzi form), a constant-strain membrane patch test and the torsion of folded strips described above; runs the SSRC 2025 benchmarks above; and solves simply supported and clamped rectangular plate buckling problems, including thickness independence and invariance to the plate's orientation in 3D. `test/benchmarks.jl` holds the mesh and solver drivers shared by the tests.
 
 ---
 

@@ -163,3 +163,71 @@ function plate_buckling(a, b, t, nx, ny; Cs = Q.DEFAULT_SHEAR_RELAXATION, plane 
     return (; k, Pcr, σcr = Pcr / (b * t), shortening, σXX)
 end
 
+
+# --------------------------------------------------------------------------------------------
+# Saint-Venant torsion of a prismatic open section by a warping-free static twist (Moen 2008,
+# Sec. 4.2.7.3.2.3, Fig. 4.41): z = 0 all nodes fixed in X, Y (twist restrained, warping free) and one
+# node fixed in Z; z = L all nodes given the rigid rotation βo about the section's mean point; T is the
+# resultant moment of the end reactions, J = T L / (G βo). `section` is a centerline polyline (X, Y).
+# --------------------------------------------------------------------------------------------
+function strip_section(α_deg, b; n = 8)
+    # a strip of width b folded in two at α_deg (0 = flat), n elements across
+    a = deg2rad(α_deg); h = n ÷ 2
+    X = [b / 2 * k / h for k in 0:h]; Y = zeros(h + 1)
+    append!(X, [b / 2 + b / 2 * cos(a) * k / h for k in 1:h]); append!(Y, [b / 2 * sin(a) * k / h for k in 1:h])
+    return X, Y
+end
+
+function lipped_c_section(; lip = 19.05, B = 76.2, D = 76.2, R = 5.05, n_flat = 4, n_corner = 5)
+    # lipped C centerline with rounded corners (3 × 3 × 0.074 in upright in mm), corners as arcs
+    pts = Tuple{Float64,Float64}[]
+    function flat!(p0, p1, n)
+        for k in (isempty(pts) ? 0 : 1):n
+            push!(pts, (p0[1] + (p1[1] - p0[1]) * k / n, p0[2] + (p1[2] - p0[2]) * k / n))
+        end
+    end
+    function arc!(c, φ0, φ1, n)
+        for k in 1:n
+            φ = φ0 + (φ1 - φ0) * k / n
+            push!(pts, (c[1] + R * cos(φ), c[2] + R * sin(φ)))
+        end
+    end
+    flat!((B, D - lip), (B, D - R), n_flat)                  # top lip, from its tip up to the corner
+    arc!((B - R, D - R), 0.0, π / 2, n_corner)
+    flat!((B - R, D), (R, D), n_flat)                        # top flange
+    arc!((R, D - R), π / 2, π, n_corner)
+    flat!((0.0, D - R), (0.0, R), n_flat)                    # web
+    arc!((R, R), π, 3π / 2, n_corner)
+    flat!((R, 0.0), (B - R, 0.0), n_flat)                    # bottom flange
+    arc!((B - R, R), 3π / 2, 2π, n_corner)
+    flat!((B, R), (B, lip), n_flat)                          # bottom lip
+    return first.(pts), last.(pts)
+end
+
+function torsion_J(section, t; L = 700.0, nz = 56, Cs = Q.DEFAULT_SHEAR_RELAXATION,
+                   drilling = Q.DEFAULT_DRILLING, drilling_gamma = Q.DEFAULT_DRILLING_GAMMA)
+    X, Y = section
+    G = E / (2 * (1 + ν)); βo = 0.01
+    nn = length(X); Z = collect(range(0.0, L, nz + 1))
+    Jthin = sum(hypot(X[i+1] - X[i], Y[i+1] - Y[i]) for i in 1:nn-1) * t^3 / 3
+    nodes = [Ferrite.Node(Ferrite.Vec(X[i], Y[i], Z[j])) for j in 1:nz+1 for i in 1:nn]
+    id(i, j) = (j - 1) * nn + i
+    cells = [Ferrite.Quadrilateral((id(i, j), id(i, j + 1), id(i + 1, j + 1), id(i + 1, j))) for j in 1:nz for i in 1:nn-1]
+    grid = Ferrite.Grid(cells, nodes)
+    dh, node_to_dofs = shell_dofhandler(grid)
+    K = allocate_matrix(dh)
+    K = Q.assemble_global_Ke!(K, dh, qr_m, qr_b, ip4, ip6, E, ν, t; Cs, drilling, drilling_gamma)
+    K0 = copy(K)
+    Xc = sum(X) / nn; Yc = sum(Y) / nn
+    end0 = Set(id(i, 1) for i in 1:nn); endL = Set(id(i, nz + 1) for i in 1:nn)
+    ch = ConstraintHandler(dh)
+    add!(ch, Dirichlet(:u, end0, (x, t_) -> [0.0, 0.0], [1, 2]))
+    add!(ch, Dirichlet(:u, Set([id(1, 1)]), (x, t_) -> [0.0], [3]))
+    add!(ch, Dirichlet(:u, endL, (x, t_) -> [-βo * (x[2] - Yc), βo * (x[1] - Xc)], [1, 2]))
+    close!(ch); update!(ch, 0.0)
+    f = zeros(ndofs(dh)); apply!(K, f, ch); u = K \ f; apply!(u, ch)
+    R = K0 * u
+    T = sum((grid.nodes[n].x[1] - Xc) * R[node_to_dofs[n][2]] - (grid.nodes[n].x[2] - Yc) * R[node_to_dofs[n][1]] for n in endL)
+    Fnet = hypot(sum(R[node_to_dofs[n][1]] for n in endL), sum(R[node_to_dofs[n][2]] for n in endL)) / abs(T)
+    return (; J = T * L / (G * βo), Jthin, Fnet)
+end

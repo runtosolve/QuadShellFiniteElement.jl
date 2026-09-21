@@ -34,6 +34,33 @@ beam-like bending benchmarks of Moen & Ádány (2025) are matched to 0.2% even o
 """
 const DEFAULT_SHEAR_RELAXATION = 0.1
 
+"""
+    DEFAULT_DRILLING
+    DEFAULT_DRILLING_GAMMA
+
+Default treatment of the drilling (in-plane rotation) dof `θz`, used by
+[`local_elastic_stiffness_matrix!`](@ref) and [`assemble_global_Ke!`](@ref):
+
+- `:hughes_brezzi` (default): the Hughes & Brezzi (1989) drilling term
+  `γ ∫ (θz − ½(∂v/∂x − ∂u/∂y))² dA`, `γ = drilling_gamma × G × t`, integrated with the membrane
+  quadrature on the bilinear corner functions. It ties `θz` to the in-plane rotation of the
+  membrane displacement field, is energy-free for rigid rotations and for the true in-plane rotation
+  of a strip in Saint-Venant torsion, and lets the twisting moment of one plate strip pass across a
+  fold line into the next strip. `DEFAULT_DRILLING_GAMMA = 1.0`; results are insensitive to `γ`
+  between about 0.1 and 10 times `G t`.
+- `:penalty`: S. Ádány's MATLAB q42 treatment, a diagonal penalty of 1/100 of the smallest
+  rotational diagonal term on each `θz`.
+
+The penalty on the absolute `θz` is fine for flat plates but wrong for folded or curved shells in
+torsion: in Saint-Venant torsion every plate strip rotates in-plane at the rate `β′ h`, which the
+penalty resists, so the torsion constant of a lipped C comes out 2 to 3 times too large and grows
+with corner refinement. Removing the penalty instead makes every fold line behave as a free edge
+for the twisting moment (J ≈ 12% low for a lipped C). The Hughes–Brezzi term gives J within 1% of
+the exact Saint-Venant value (see `test/runtests.jl`, "torsion of folded strips").
+"""
+const DEFAULT_DRILLING = :hughes_brezzi
+const DEFAULT_DRILLING_GAMMA = 1.0
+
 # --------------------------------------------------------------------------------------------
 # Interpolations on the reference quadrilateral ξ, η ∈ [-1, 1]
 # --------------------------------------------------------------------------------------------
@@ -255,8 +282,8 @@ const FIELD_ORDER_24 = [1, 2, 3, 7, 8, 9, 13, 14, 15, 19, 20, 21,
                         4, 5, 6, 10, 11, 12, 16, 17, 18, 22, 23, 24]
 
 """
-    local_elastic_stiffness_matrix!(cv_m, cv_b, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION)
-    local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION)
+    local_elastic_stiffness_matrix!(cv_m, cv_b, E, ν, t, x; Cs, drilling, drilling_gamma)
+    local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, t, x; Cs, drilling, drilling_gamma)
 
 24×24 element elastic stiffness matrix in the element local frame (node dofs ordered
 `[u, v, w, θx, θy, θz]` per node). `x` holds the four planar node coordinates
@@ -266,11 +293,13 @@ membrane quadrature (2×2 Gauss recommended) and `cv_b` the plate quadrature (3�
 recommended). The second form builds them from quadrature rules and interpolations.
 
 The membrane matrix is condensed from 12 to 8 dofs and the plate (bending + shear) matrix from 18
-to 12 dofs, then the drilling dof `θz` is added with a penalty stiffness of 1/100 of the smallest
-rotational diagonal term. `Cs` is the shear relaxation factor, see
+to 12 dofs, then the drilling dof `θz` is added: `drilling = :hughes_brezzi` (default) adds the
+Hughes–Brezzi term with `γ = drilling_gamma × G t`, `drilling = :penalty` adds the MATLAB q42 diagonal
+penalty, see [`DEFAULT_DRILLING`](@ref). `Cs` is the shear relaxation factor, see
 [`DEFAULT_SHEAR_RELAXATION`](@ref).
 """
-function local_elastic_stiffness_matrix!(cv_m::CellValues, cv_b::CellValues, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION)
+function local_elastic_stiffness_matrix!(cv_m::CellValues, cv_b::CellValues, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION,
+                                         drilling = DEFAULT_DRILLING, drilling_gamma = DEFAULT_DRILLING_GAMMA)
 
     ##### membrane: 4 + 2 shape functions, 12 dof → 8 dof
     reinit!(cv_m, x)
@@ -303,34 +332,73 @@ function local_elastic_stiffness_matrix!(cv_m::CellValues, cv_b::CellValues, E, 
     k24 = zeros(Float64, 6 * NNODES, 6 * NNODES)
     k24[MAP_20_TO_24, MAP_20_TO_24] = k20
 
-    stif = minimum(diag(k20)[IND_ROT_20]) / 100
-    for i in IND_DRILL_24
-        k24[i, i] = stif
+    add_drilling_stiffness!(k24, cv_m, k20, E, ν, t, drilling, drilling_gamma)
+
+    return k24
+
+end
+
+function local_elastic_stiffness_matrix!(qr_m, qr_b, ip4::IP4, ip6::IP6, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION,
+                                         drilling = DEFAULT_DRILLING, drilling_gamma = DEFAULT_DRILLING_GAMMA)
+
+    cv_m = CellValues(qr_m, ip6, ip4)
+    cv_b = CellValues(qr_b, ip6, ip4)
+
+    return local_elastic_stiffness_matrix!(cv_m, cv_b, E, ν, t, x; Cs, drilling, drilling_gamma)
+
+end
+
+"""
+    add_drilling_stiffness!(k24, cv_m, k20, E, ν, t, drilling, drilling_gamma)
+
+Add the drilling dof stiffness to the 24×24 local element matrix `k24` (node dofs `[u v w θx θy θz]`),
+see [`DEFAULT_DRILLING`](@ref). `cv_m` must be `reinit!`ed on the planar element coordinates; its
+first four shape functions are the bilinear corner functions used for the Hughes–Brezzi term.
+`k20` is the 20×20 matrix without drilling dofs (used by the `:penalty` option).
+"""
+function add_drilling_stiffness!(k24, cv_m, k20, E, ν, t, drilling, drilling_gamma)
+
+    if drilling == :penalty
+        stif = minimum(diag(k20)[IND_ROT_20]) / 100
+        for i in IND_DRILL_24
+            k24[i, i] = stif
+        end
+    elseif drilling == :hughes_brezzi
+        G = E / (2 * (1 + ν))
+        γ = drilling_gamma * G * t
+        row = zeros(Float64, 6 * NNODES)
+        for q_point in 1:getnquadpoints(cv_m)
+            dΩ = getdetJdV(cv_m, q_point)
+            fill!(row, 0.0)
+            for i in 1:NNODES
+                dN = shape_gradient(cv_m, q_point, i)
+                N = shape_value(cv_m, q_point, i)
+                row[6(i - 1) + 1] = -0.5 * dN[2]      # u_i:  ½(∂v/∂x − ∂u/∂y)
+                row[6(i - 1) + 2] = 0.5 * dN[1]       # v_i
+                row[6(i - 1) + 6] = -N                # θz_i
+            end
+            k24 .+= γ .* (row * row') .* dΩ
+        end
+    else
+        throw(ArgumentError("drilling must be :hughes_brezzi or :penalty, got $drilling"))
     end
 
     return k24
 
 end
 
-function local_elastic_stiffness_matrix!(qr_m, qr_b, ip4::IP4, ip6::IP6, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION)
-
-    cv_m = CellValues(qr_m, ip6, ip4)
-    cv_b = CellValues(qr_b, ip6, ip4)
-
-    return local_elastic_stiffness_matrix!(cv_m, cv_b, E, ν, t, x; Cs = Cs)
-
-end
-
 """
-    assemble_global_Ke!(Ke, dh, qr_m, qr_b, ip4, ip6, E, ν, t; Cs = DEFAULT_SHEAR_RELAXATION)
+    assemble_global_Ke!(Ke, dh, qr_m, qr_b, ip4, ip6, E, ν, t; Cs, drilling, drilling_gamma)
 
 Assemble the global elastic stiffness matrix for a shell mesh with fields `:u` (3 translations)
 and `:θ` (3 rotations) on `Quadrilateral` cells with 3D node coordinates. Element matrices are
 formed in each element's local frame and rotated to global coordinates. `qr_m` and `qr_b` are the
 membrane and plate quadrature rules (`QuadratureRule{RefQuadrilateral}(2)` and `(3)` recommended).
-`Cs` is the shear relaxation factor, see [`DEFAULT_SHEAR_RELAXATION`](@ref).
+`Cs` is the shear relaxation factor, see [`DEFAULT_SHEAR_RELAXATION`](@ref); `drilling` and
+`drilling_gamma` select the drilling dof treatment, see [`DEFAULT_DRILLING`](@ref).
 """
-function assemble_global_Ke!(Ke, dh, qr_m, qr_b, ip4::IP4, ip6::IP6, E, ν, t; Cs = DEFAULT_SHEAR_RELAXATION)
+function assemble_global_Ke!(Ke, dh, qr_m, qr_b, ip4::IP4, ip6::IP6, E, ν, t; Cs = DEFAULT_SHEAR_RELAXATION,
+                             drilling = DEFAULT_DRILLING, drilling_gamma = DEFAULT_DRILLING_GAMMA)
 
     cv_m = CellValues(qr_m, ip6, ip4)
     cv_b = CellValues(qr_b, ip6, ip4)
@@ -342,7 +410,7 @@ function assemble_global_Ke!(Ke, dh, qr_m, qr_b, ip4::IP4, ip6::IP6, E, ν, t; C
         T = calculation_rotation_matrix(x_global)
         x_local = global_nodal_coords_to_planar_coords(x_global, T)
 
-        ke_local = local_elastic_stiffness_matrix!(cv_m, cv_b, E, ν, t, x_local; Cs = Cs)
+        ke_local = local_elastic_stiffness_matrix!(cv_m, cv_b, E, ν, t, x_local; Cs, drilling, drilling_gamma)
 
         # rotate element stiffness matrix back to global coordinates
         Te = rotation_matrix_for_element_stiffness_drilling(T)
