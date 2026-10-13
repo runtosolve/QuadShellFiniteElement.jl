@@ -13,9 +13,11 @@ module QuadShellFiniteElement
 # local planar frame and rotated to global 3D coordinates, so the element can be used for
 # arbitrarily oriented (folded, warped) shell meshes managed by Ferrite.jl.
 
-using Ferrite, LinearAlgebra, Tensors
+using Ferrite, LinearAlgebra, SparseArrays, Tensors, StaticArrays
 
 export IP4, IP6
+export IsotropicHardening, J2PlaneStress, ShellSection, PlasticShellModel
+export assemble_internal!, commit!, restore!, solve_nonlinear, element_results, displaced_grid, lumped_mass
 
 """
     DEFAULT_SHEAR_RELAXATION
@@ -282,6 +284,38 @@ const FIELD_ORDER_24 = [1, 2, 3, 7, 8, 9, 13, 14, 15, 19, 20, 21,
                         4, 5, 6, 10, 11, 12, 16, 17, 18, 22, 23, 24]
 
 """
+    local_elastic_pieces(cv_m, cv_b, E, ν, t, x; Cs) -> (ke_m, ke_b, ke_s)
+
+The uncondensed linear elastic building blocks of the element in its local frame after
+`reinit!`ing `cv_m` and `cv_b` on the planar coordinates `x`: the membrane matrix `ke_m` (12×12,
+dofs `u1 v1 … u6 v6`), the bending matrix `ke_b` (18×18, dofs `w1 θx1 θy1 … θy6`) and the
+transverse shear matrix `ke_s` (18×18, same dofs) with the shear relaxation `1 / (1 + Cs alpha)`
+applied, see [`DEFAULT_SHEAR_RELAXATION`](@ref).
+"""
+function local_elastic_pieces(cv_m::CellValues, cv_b::CellValues, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION)
+
+    reinit!(cv_m, x)
+    Dm = calculate_membrane_constitutive_matrix(E, ν, t)
+    ke_m = calculate_element_membrane_stiffness_matrix(Dm, cv_m)
+
+    reinit!(cv_b, x)
+    Db = calculate_bending_constitutive_matrix(E, ν, t)
+    Ds = calculate_shear_constitutive_matrix(E, ν, t)
+    ke_b = calculate_element_bending_stiffness_matrix(Db, cv_b)
+    ke_s = calculate_element_shear_stiffness_matrix(Ds, cv_b)
+
+    if Cs != 0.0
+        # shear / bending rotational stiffness ratio on the corner-node rotations
+        rot = [2, 3, 5, 6, 8, 9, 11, 12]
+        alpha = sum(diag(ke_s[rot, rot])) / sum(diag(ke_b[rot, rot]))
+        ke_s = ke_s .* (1 / (1 + Cs * alpha))
+    end
+
+    return ke_m, ke_b, ke_s
+
+end
+
+"""
     local_elastic_stiffness_matrix!(cv_m, cv_b, E, ν, t, x; Cs, drilling, drilling_gamma)
     local_elastic_stiffness_matrix!(qr_m, qr_b, ip4, ip6, E, ν, t, x; Cs, drilling, drilling_gamma)
 
@@ -301,26 +335,12 @@ penalty, see [`DEFAULT_DRILLING`](@ref). `Cs` is the shear relaxation factor, se
 function local_elastic_stiffness_matrix!(cv_m::CellValues, cv_b::CellValues, E, ν, t, x; Cs = DEFAULT_SHEAR_RELAXATION,
                                          drilling = DEFAULT_DRILLING, drilling_gamma = DEFAULT_DRILLING_GAMMA)
 
+    ke_m, ke_b, ke_s = local_elastic_pieces(cv_m, cv_b, E, ν, t, x; Cs)
+
     ##### membrane: 4 + 2 shape functions, 12 dof → 8 dof
-    reinit!(cv_m, x)
-    Dm = calculate_membrane_constitutive_matrix(E, ν, t)
-    ke_m = calculate_element_membrane_stiffness_matrix(Dm, cv_m)
     ke_m = static_condensation(ke_m, 2 * NNODES)
 
     ##### bending + transverse shear: 4 + 2 shape functions, 18 dof → 12 dof
-    reinit!(cv_b, x)
-    Db = calculate_bending_constitutive_matrix(E, ν, t)
-    Ds = calculate_shear_constitutive_matrix(E, ν, t)
-    ke_b = calculate_element_bending_stiffness_matrix(Db, cv_b)
-    ke_s = calculate_element_shear_stiffness_matrix(Ds, cv_b)
-
-    if Cs != 0.0
-        # shear / bending rotational stiffness ratio on the corner-node rotations
-        rot = [2, 3, 5, 6, 8, 9, 11, 12]
-        alpha = sum(diag(ke_s[rot, rot])) / sum(diag(ke_b[rot, rot]))
-        ke_s = ke_s .* (1 / (1 + Cs * alpha))
-    end
-
     ke_wt = static_condensation(ke_b + ke_s, 3 * NNODES)
 
     ##### 5 dof per node, 20 × 20
@@ -734,5 +754,9 @@ function rotation_matrix_for_element_stiffness_no_drilling(T3)
     return T
 
 end
+
+include("plasticity.jl")
+include("nonlinear.jl")
+include("solver.jl")
 
 end # module QuadShellFiniteElement

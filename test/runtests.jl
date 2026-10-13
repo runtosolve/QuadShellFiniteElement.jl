@@ -238,3 +238,5 @@ t = 0.0346 * 25.4     # mm (33 mil), b/t ≈ 105
         @test torsion_J(lipped_c_section(), 1.88; drilling_gamma = 10.0).J ≈ c.J rtol = 0.005
     end
 end
+
+include("plasticity_tests.jl")

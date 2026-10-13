@@ -211,6 +211,84 @@ using Pkg; Pkg.test("QuadShellFiniteElement")
 
 ---
 
+## Elastic–plastic, geometrically nonlinear analysis
+
+Version 0.3.0 adds von Mises plasticity with isotropic hardening and a geometrically nonlinear
+internal force vector / tangent stiffness, with the same API in TriShellFiniteElement.jl and
+QuadShellFiniteElement.jl (`src/plasticity.jl` and `src/solver.jl` are shared verbatim).
+
+- **Material**: `J2PlaneStress(E, ν, hardening)` with `IsotropicHardening(εp, σ)`, a piecewise-linear
+  true stress – equivalent plastic strain table (first point = initial yield, constant beyond the last
+  point, like ABAQUS `*PLASTIC`); `IsotropicHardening(σy)` is perfectly plastic and
+  `IsotropicHardening(σy, H)` linear hardening. The plane-stress return mapping is the projected
+  algorithm of Simo & Taylor (1986) with a safeguarded scalar Newton on the plastic multiplier and
+  the algorithmically consistent tangent (checked against finite differences in the tests).
+- **Section**: `ShellSection(mat, t; nlayers = 5, rule = :gauss | :simpson)` integrates the layer
+  stresses through the thickness into membrane forces and moments and the coupled section tangent;
+  `rule = :simpson` with an odd `nlayers` includes the surfaces and the midplane (ABAQUS shell default).
+- **Element**: total Lagrangian in each element's initial local frame. The membrane strain is the
+  Green–Lagrange strain of the midsurface with the gradients of all three displacements
+  (`εx = u,x + ½(u,x² + v,x² + w,x²)`, …), the same quadratic terms the geometric stiffness of the
+  linear buckling analysis is built from; the curvatures are linear in the rotations and the
+  transverse shear and drilling terms stay linear elastic (with the same `Cs` relaxation and drilling
+  treatment as the linear element). The tangent at zero displacement is exactly the matrix of
+  `assemble_global_Ke!`. The 4 + 2 interpolation is kept for all five displacement functions; the ten
+  bubble amplitudes are element-internal variables condensed out of the element tangent and
+  residual at every evaluation and updated from the stored linearization before the next one
+  (as in enhanced-assumed-strain elements), so the DofHandler is unchanged. The formulation is meant for moderate rotations (plate and
+  thin-walled member collapse); it is not a corotational large-rotation shell.
+- **Model and solver**: `PlasticShellModel(dh, section; Cs, drilling, drilling_gamma)` stores the
+  element data and plastic history, `assemble_internal!(K, f, model, u)` assembles the tangent and
+  internal force, `commit!` / `restore!` accept or discard the state of a step, `element_results`
+  returns membrane forces, moments, equivalent plastic strain and layer stresses, and
+  `displaced_grid` imposes an imperfection. `solve_nonlinear(model, ch; ...)` is an incremental
+  Newton–Raphson driver for a Ferrite `ConstraintHandler` whose Dirichlet values depend on the
+  pseudo-time (displacement control) and/or an external load `f_ext(t)`, with a tangent predictor
+  at each step, a backtracking line search, adaptive step cutting/growing and optional artificial
+  damping (`damping = :auto`, the `*STATIC, STABILIZE` idea with a unit-density lumped mass
+  from `lumped_mass`) for mode jumps and snaps under displacement control.
+
+```julia
+using QuadShellFiniteElement, Ferrite
+M = QuadShellFiniteElement
+
+hard = IsotropicHardening([0.0, 0.0016, 0.0259, 0.07, 0.1407, 0.1988],      # true plastic strain
+                          [33.0, 34.31, 42.14, 51.35, 60.86, 65.5])          # true stress, ksi
+mat = J2PlaneStress(29500.0, 0.3, hard)
+sec = ShellSection(mat, 0.0346; nlayers = 5, rule = :simpson)
+model = PlasticShellModel(dh, sec)              # dh: fields :u, :θ on the (imperfect) mesh
+
+ch = ConstraintHandler(dh)                      # displacement control: edges move ±t·δmax
+add!(ch, Dirichlet(:u, perimeter, (x, t) -> [0.0], [3]))
+add!(ch, Dirichlet(:u, edge_x0, (x, t) -> [t * δmax], [1]))
+add!(ch, Dirichlet(:u, edge_xL, (x, t) -> [-t * δmax], [1]))
+close!(ch)
+
+hist = solve_nonlinear(model, ch; reaction_dofs = u_dofs_of_edge_xL, Δt = 0.01, Δt_max = 0.02)
+P = -hist.P                                     # reaction (compression positive) vs hist.t
+res = element_results(model, hist.u)            # N, M, ε̄p, layer stresses per integration point
+```
+
+### Validation: stiffened element loaded to collapse (Moen 2008, Section 7.1)
+
+The simply supported plate of Moen (2008), "Direct Strength Design of Cold-Formed Steel Members
+with Perforations", PhD dissertation, Johns Hopkins University, Section 7.1 (h = 3.4 in, L = 27.2 in,
+t = 0.0346 in, E = 29500 ksi, ν = 0.3, the true stress–strain curve of Fig. 7.1, loaded edges
+displaced uniformly, imperfection = fundamental buckling mode scaled to d₁/t) was run with this
+element on a 128 × 16 mesh (2048 elements) with 5 Simpson layers and compared with the ABAQUS S9R5
+results of the dissertation. See the study in
+`RunToSolve/Projects/OneRack/base_plate_modeling_2025/Tri_Quad_isotropic_hardening_plasticity_CDM_dissertation_plates_2026`
+for the scripts, all cases (imperfection series, Fig. 7.2 boundary conditions, slotted hole) and figures.
+
+| quantity | Moen (2008) | QuadShellFiniteElement |
+|---|---|---|
+| elastic buckling Pcr/Pᵧ | 0.33 (Fig. 7.16) | 0.332 |
+| peak load, d₁/t = 0.34, P/Pᵧ | 0.50 (Fig. 7.17) | 0.504 |
+| δ/t at the peak | ≈ 0.50 | 0.52 |
+| effective width at the peak, midplane S11, hₑ/h | 0.51 (0.48–0.55, Fig. 7.21) | 0.54 (0.52–0.58) |
+
+---
+
 ## Dependencies
 
 | Package | Role |
@@ -218,5 +296,7 @@ using Pkg; Pkg.test("QuadShellFiniteElement")
 | [Ferrite.jl](https://github.com/Ferrite-FEM/Ferrite.jl) | Mesh, DOF handler, cell values, quadrature |
 | [Tensors.jl](https://github.com/Ferrite-FEM/Tensors.jl) | Coordinate vectors and tensor operations |
 | LinearAlgebra | Matrix operations (standard library) |
+| SparseArrays | Artificial damping diagonal in the nonlinear solver (standard library) |
+| [StaticArrays.jl](https://github.com/JuliaArrays/StaticArrays.jl) | Small fixed-size vectors and matrices in the plasticity routines |
 
 ---
